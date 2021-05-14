@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/fatih/color"
@@ -29,21 +30,22 @@ func main() {
 		bold   = color.New(color.Bold, color.FgWhite)
 		italic = color.New(color.Italic)
 
-		today          = time.Now()
-		threeMonthsAgo = today.AddDate(0, -3, 0)
+		from, _ = time.Parse("2006-01-02", "2021-02-01")
+		to, _   = time.Parse("2006-01-02", "2021-04-30")
 
 		rs = rfcs(ctx, client)
 		ps = prs(ctx, client)
 	)
 
 	rs = filterNonVMware(ctx, client, rs)
-	rs = filterFromTime(rs, threeMonthsAgo)
+	rs = filterFromTime(rs, from, to)
 
 	ps = filterNonVMware(ctx, client, ps)
-	ps = filterFromTime(ps, threeMonthsAgo)
+	ps = filterFromTime(ps, from, to)
 
-	responseTime := avgResponseTime(ctx, client, rs) + avgResponseTime(ctx, client, ps)
-	avgResponseTime := int64(responseTime) / int64(len(rs)+len(ps))
+	rsrt := responseTimes(ctx, client, rs)
+	psrt := responseTimes(ctx, client, ps)
+	medianResponseTime := median(rsrt, psrt)
 
 	rsRevCount := prReviewsCount(ctx, client, rs)
 	psRevCount := prReviewsCount(ctx, client, ps)
@@ -59,14 +61,14 @@ func main() {
 
 	bold.Println("Team Efficiency")
 	output = []string{
-		fmt.Sprintf("Count of RFCs Reviews by team members | %d", rsRevCount + psRevCount),
-		fmt.Sprintf("Average response time to community member | %s", time.Duration(avgResponseTime)),
+		fmt.Sprintf("Count of RFC + PR Reviews by team members | %d", rsRevCount+psRevCount),
+		fmt.Sprintf("Median response time to RFC + PR | %s", time.Duration(medianResponseTime)),
 		fmt.Sprintf("Number of RFCs that result in customer outcome | %s", "-")}
 	fmt.Println(columnize.SimpleFormat(output) + "\n")
 
 	output = []string{
-		italic.Sprintf("from: | %s", threeMonthsAgo.Format(time.Stamp)),
-		italic.Sprintf("to: | %s", today.Format(time.Stamp))}
+		italic.Sprintf("from: | %s", from.Format(time.Stamp)),
+		italic.Sprintf("to: | %s", to.Format(time.Stamp))}
 	fmt.Println(columnize.SimpleFormat(output))
 }
 
@@ -113,11 +115,11 @@ func filterNonVMware(ctx context.Context, client *github.Client, prs []*github.P
 	return result
 }
 
-func filterFromTime(prs []*github.PullRequest, from time.Time) []*github.PullRequest {
+func filterFromTime(prs []*github.PullRequest, from time.Time, to time.Time) []*github.PullRequest {
 	var result []*github.PullRequest
 
 	for _, pr := range prs {
-		if pr.GetCreatedAt().After(from) {
+		if from.Before(pr.GetCreatedAt()) && to.After(pr.GetCreatedAt()) {
 			result = append(result, pr)
 		}
 	}
@@ -192,8 +194,8 @@ func prReviewsCount(ctx context.Context, client *github.Client, prs []*github.Pu
 	return count
 }
 
-func avgResponseTime(ctx context.Context, client *github.Client, prs []*github.PullRequest) time.Duration {
-	var t time.Duration
+func responseTimes(ctx context.Context, client *github.Client, prs []*github.PullRequest) []time.Duration {
+	var ts []time.Duration
 
 	for _, pr := range prs {
 		owner := pr.GetBase().GetRepo().GetOwner().GetLogin()
@@ -214,10 +216,10 @@ func avgResponseTime(ctx context.Context, client *github.Client, prs []*github.P
 			continue
 		}
 
-		t = t + comments[0].GetCreatedAt().Sub(pr.GetCreatedAt())
+		ts = append(ts, comments[0].GetCreatedAt().Sub(pr.GetCreatedAt()))
 	}
 
-	return t
+	return ts
 }
 
 func allPRs(ctx context.Context, client *github.Client, repo string) ([]*github.PullRequest, error) {
@@ -241,6 +243,27 @@ func allPRs(ctx context.Context, client *github.Client, repo string) ([]*github.
 		result = append(result, prs...)
 		page = page + 1
 	}
+}
+
+func median(ts ...[]time.Duration) time.Duration {
+	var elements []time.Duration
+	for _, arr := range ts {
+		for _, item := range arr {
+			elements = append(elements, item)
+		}
+	}
+
+	sort.Slice(elements, func(i, j int) bool {
+		return elements[i] < elements[j]
+	})
+
+	mNumber := len(elements) / 2
+
+	if mNumber % 2 != 0 {
+		return elements[mNumber]
+	}
+
+	return (elements[mNumber-1] + elements[mNumber]) / 2
 }
 
 func expectNoError(err error) {
