@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -30,8 +31,8 @@ func main() {
 		bold   = color.New(color.Bold, color.FgWhite)
 		italic = color.New(color.Italic)
 
-		from, _ = time.Parse("2006-01-02", "2021-02-01")
-		to, _   = time.Parse("2006-01-02", "2021-04-30")
+		from, _ = time.Parse("2006-01-02", "2021-05-01")
+		to, _   = time.Parse("2006-01-02", "2021-07-31")
 
 		rs = rfcs(ctx, client)
 		ps = prs(ctx, client)
@@ -50,20 +51,23 @@ func main() {
 	rsRevCount := prReviewsCount(ctx, client, rs)
 	psRevCount := prReviewsCount(ctx, client, ps)
 
+	iss := issues(ctx, client, from)
+	iss = filterFromTimeIssues(iss, from, to)
+	isrt := responseTimesIssues(ctx, client, filterNonVMwareIssues(ctx, client, iss))
+	medianResponseTimeIssues := median(isrt)
+
 	bold.Println("Community Health")
 	output := []string{
-		fmt.Sprintf("Non-VMware people in community meetings | %s", "-"),
-		fmt.Sprintf("Non-VMware people in buildpacks slack | %s", "-"),
 		fmt.Sprintf("RFCs from Non-VMware people | %d", len(rs)),
-		fmt.Sprintf("PRs from Non-VMware people | %d", len(ps)),
-		fmt.Sprintf("GitHub Discussion comments from Non-VMware people | %s", "-")}
+		fmt.Sprintf("PRs from Non-VMware people | %d", len(ps))}
 	fmt.Println(columnize.SimpleFormat(output) + "\n")
 
 	bold.Println("Team Efficiency")
 	output = []string{
 		fmt.Sprintf("Count of RFC + PR Reviews by team members | %d", rsRevCount+psRevCount),
-		fmt.Sprintf("Median response time to RFC + PR | %s", time.Duration(medianResponseTime)),
-		fmt.Sprintf("Number of RFCs that result in customer outcome | %s", "-")}
+		fmt.Sprintf("Median response time to RFC + PR | %s", medianResponseTime),
+		fmt.Sprintf("Median response time to Issues | %s", medianResponseTimeIssues),
+		fmt.Sprintf("Percentage of \"good-first-issues\" | %f%%", goodFirstIssues(iss))}
 	fmt.Println(columnize.SimpleFormat(output) + "\n")
 
 	output = []string{
@@ -73,7 +77,8 @@ func main() {
 }
 
 var isVMwareMapping = map[string]bool{}
-var ours = []string{"pivotal",
+var ours = []string{
+	"pivotal",
 	"pivotal-legacy",
 	"vmware",
 	"vmware-tanzu",
@@ -115,12 +120,48 @@ func filterNonVMware(ctx context.Context, client *github.Client, prs []*github.P
 	return result
 }
 
+func filterNonVMwareIssues(ctx context.Context, client *github.Client, issues []*github.Issue) []*github.Issue {
+	var result []*github.Issue
+
+	for _, issue := range issues {
+		flag, ok := isVMwareMapping[*issue.User.Login]
+		if ok && !flag {
+			result = append(result, issue)
+			continue
+		}
+
+		orgs, _, err := client.Organizations.List(ctx, *issue.User.Login, nil)
+		expectNoError(err)
+
+		flag = isVMware(orgs)
+		if !flag {
+			result = append(result, issue)
+		}
+
+		isVMwareMapping[*issue.User.Login] = flag
+	}
+
+	return result
+}
+
 func filterFromTime(prs []*github.PullRequest, from time.Time, to time.Time) []*github.PullRequest {
 	var result []*github.PullRequest
 
 	for _, pr := range prs {
 		if from.Before(pr.GetCreatedAt()) && to.After(pr.GetCreatedAt()) {
 			result = append(result, pr)
+		}
+	}
+
+	return result
+}
+
+func filterFromTimeIssues(issues []*github.Issue, from time.Time, to time.Time) []*github.Issue {
+	var result []*github.Issue
+
+	for _, issue := range issues {
+		if from.Before(issue.GetCreatedAt()) && to.After(issue.GetCreatedAt()) {
+			result = append(result, issue)
 		}
 	}
 
@@ -156,6 +197,53 @@ func prs(ctx context.Context, client *github.Client) []*github.PullRequest {
 	result = append(result, prs3...)
 	result = append(result, prs4...)
 	result = append(result, prs5...)
+	return result
+}
+
+func goodFirstIssues(issues []*github.Issue) float64 {
+	var goodFirstIssueCount int
+
+	for _, issue := range issues {
+		if hasGoodFirstIssueLabel(issue) {
+			goodFirstIssueCount++
+		}
+	}
+
+	return (float64(goodFirstIssueCount) / float64(len(issues))) * 100
+}
+
+func hasGoodFirstIssueLabel(issue *github.Issue) bool {
+	for _, label := range issue.Labels {
+		if strings.Contains(label.GetName(), "good-first-issue") || strings.Contains(label.GetName(), "good first issue") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func issues(ctx context.Context, client *github.Client, since time.Time) []*github.Issue {
+	issues1, err := allIssues(ctx, client, "pack", since)
+	expectNoError(err)
+
+	issues2, err := allIssues(ctx, client, "lifecycle", since)
+	expectNoError(err)
+
+	issues3, err := allIssues(ctx, client, "spec", since)
+	expectNoError(err)
+
+	issues4, err := allIssues(ctx, client, "imgutil", since)
+	expectNoError(err)
+
+	issues5, err := allIssues(ctx, client, "docs", since)
+	expectNoError(err)
+
+	var result []*github.Issue
+	result = append(result, issues1...)
+	result = append(result, issues2...)
+	result = append(result, issues3...)
+	result = append(result, issues4...)
+	result = append(result, issues5...)
 	return result
 }
 
@@ -222,6 +310,35 @@ func responseTimes(ctx context.Context, client *github.Client, prs []*github.Pul
 	return ts
 }
 
+func responseTimesIssues(ctx context.Context, client *github.Client, issues []*github.Issue) []time.Duration {
+	var ts []time.Duration
+
+	for _, issue := range issues {
+		url := strings.Split(issue.GetRepositoryURL(), "/")
+		owner := url[len(url) - 2]
+		repo := url[len(url) - 1]
+		number := issue.GetNumber()
+
+		comments, _, err := client.Issues.ListComments(ctx, owner, repo, number, &github.IssueListCommentsOptions{
+			Sort:      sPtr("created"),
+			Direction: sPtr("asc"),
+			ListOptions: github.ListOptions{
+				Page:    1,
+				PerPage: 1,
+			},
+		})
+		expectNoError(err)
+
+		if len(comments) == 0 {
+			continue
+		}
+
+		ts = append(ts, comments[0].GetCreatedAt().Sub(issue.GetCreatedAt()))
+	}
+
+	return ts
+}
+
 func allPRs(ctx context.Context, client *github.Client, repo string) ([]*github.PullRequest, error) {
 	var (
 		result []*github.PullRequest
@@ -245,6 +362,29 @@ func allPRs(ctx context.Context, client *github.Client, repo string) ([]*github.
 	}
 }
 
+func allIssues(ctx context.Context, client *github.Client, repo string, since time.Time) ([]*github.Issue, error) {
+	var (
+		result []*github.Issue
+		page   = 1
+	)
+
+	for {
+		var err error
+		iss, _, err := client.Issues.ListByRepo(ctx, "buildpacks", repo, &github.IssueListByRepoOptions{
+			Since: since, State: "all", ListOptions: github.ListOptions{Page: page, PerPage: 100}})
+		if err != nil {
+			return nil, err
+		}
+
+		if len(iss) == 0 {
+			return result, nil
+		}
+
+		result = append(result, iss...)
+		page = page + 1
+	}
+}
+
 func median(ts ...[]time.Duration) time.Duration {
 	var elements []time.Duration
 	for _, arr := range ts {
@@ -259,7 +399,7 @@ func median(ts ...[]time.Duration) time.Duration {
 
 	mNumber := len(elements) / 2
 
-	if mNumber % 2 != 0 {
+	if mNumber%2 != 0 {
 		return elements[mNumber]
 	}
 
@@ -271,4 +411,8 @@ func expectNoError(err error) {
 		fmt.Printf("Error: %s\n", err)
 		os.Exit(1)
 	}
+}
+
+func sPtr(s string) *string {
+	return &s
 }
